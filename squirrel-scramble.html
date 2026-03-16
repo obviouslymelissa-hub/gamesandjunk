@@ -81,6 +81,9 @@ const CONFIG = {
   THIEF_WARNING_RANGE: 200,
   THIEF_WARNING_STASH_RANGE: 160,
   FLASHING_BORDER_STASH_RANGE: 90,
+
+  // Player dash — minimum velocity before defaulting to facing direction
+  PLAYER_DASH_MIN_VELOCITY: 10,
 };
 
 // ============================================================
@@ -366,7 +369,7 @@ class Player {
     if ((INPUT.keys['ShiftLeft'] || INPUT.keys['ShiftRight']) && this.dashCooldown <= 0 && !this.dashActive) {
       let ddx = this.vx, ddy = this.vy;
       const dv = Math.sqrt(ddx*ddx + ddy*ddy);
-      if (dv < 10) { ddx = this.facing; ddy = 0; }
+      if (dv < CONFIG.PLAYER_DASH_MIN_VELOCITY) { ddx = this.facing; ddy = 0; }
       else { ddx /= dv; ddy /= dv; }
       this.dashActive = true;
       this.dashTimer  = CONFIG.PLAYER_DASH_DURATION;
@@ -1774,6 +1777,14 @@ function gameLoop(timestamp) {
 
   requestAnimationFrame(gameLoop);
 }
+
+// Pause when the tab is hidden to prevent large delta-time jumps on restore
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden && GS.screen === 'PLAYING') {
+    GS.prevScreen = GS.screen;
+    GS.screen = 'PAUSED';
+  }
+});
 
 // Kick off the loop
 requestAnimationFrame(ts => { lastTime = ts; requestAnimationFrame(gameLoop); });
