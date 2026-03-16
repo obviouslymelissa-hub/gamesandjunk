@@ -12,6 +12,7 @@
 </head>
 <body>
 <canvas id="gc"></canvas>
+<audio id="bgm" src="GameSounds/chicken_queen_ace_step.mp3" loop preload="auto" aria-label="Background music"></audio>
 <script>
 'use strict';
 
@@ -168,6 +169,23 @@ const SFX = {
 };
 
 // ============================================================
+// Background Music
+// ============================================================
+const bgm = document.getElementById('bgm');
+bgm.volume = 0.4;
+
+function musicPlay() {
+  if (bgm.paused) bgm.play().catch(() => {});
+}
+function musicPause() {
+  if (!bgm.paused) bgm.pause();
+}
+function musicStop() {
+  bgm.pause();
+  bgm.currentTime = 0;
+}
+
+// ============================================================
 // Input handler — keyboard + mouse
 // ============================================================
 const INPUT = {
@@ -184,10 +202,13 @@ window.addEventListener('keydown', e => {
       GS.screen = 'PAUSED';
     } else if (GS.screen === 'PAUSED') {
       GS.screen = GS.prevScreen;
+      musicPlay();
     }
   }
   // Prevent scroll on arrow / space
   if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Space'].includes(e.code)) e.preventDefault();
+  // Mute / unmute music
+  if (e.code === 'KeyM') bgm.muted = !bgm.muted;
 });
 window.addEventListener('keyup', e => { delete INPUT.keys[e.code]; });
 
@@ -540,6 +561,7 @@ class Thief {
         GS.strikes++;
         if (GS.strikes >= CONFIG.MAX_STRIKES) {
           GS.screen = 'GAME_OVER';
+          musicStop();
         } else {
           this.scare(); // nothing left — flee
         }
@@ -597,6 +619,7 @@ function startGame() {
     fireworkCount: 0,
   });
   if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+  musicPlay();
 }
 
 // ============================================================
@@ -695,7 +718,7 @@ function updateGame(dt) {
     return;
   }
 
-  if (GS.screen === 'PAUSED')  return;
+  if (GS.screen === 'PAUSED') { musicPause(); return; }
   if (GS.screen !== 'PLAYING' && GS.screen !== 'LEVEL_UP_BANNER') return;
 
   // Level-up banner countdown
@@ -774,6 +797,7 @@ function updateGame(dt) {
     // Win check
     if (GS.stash >= CONFIG.WIN_STASH) {
       GS.screen = 'VICTORY';
+      musicStop();
       GS.fireworkTimer = 0;
       GS.fireworkCount = 0;
     }
@@ -1456,6 +1480,13 @@ function drawHUD() {
   ctx.textAlign    = 'center';
   ctx.textBaseline = 'middle';
   ctx.fillText(dashReady ? 'DASH READY' : 'DASH', CONFIG.W/2, bY + bH/2 + 0.5);
+
+  // Mute hint
+  ctx.fillStyle = 'rgba(255,255,255,0.45)';
+  ctx.font = '9px sans-serif';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(bgm.muted ? '🔇 M' : '🔊 M', 8, CONFIG.H - 16);
 
   // --- Active power-up display (right side) ---
   if (GS.activePowerUp) {
