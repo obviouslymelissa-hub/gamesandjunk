@@ -1,0 +1,1793 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Squirrel Scramble</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #0d1a05; overflow: hidden; width: 100vw; height: 100vh; }
+  canvas { display: block; position: absolute; }
+</style>
+</head>
+<body>
+<canvas id="gc"></canvas>
+<script>
+'use strict';
+
+// ============================================================
+// CONFIG — All tunable values in one place
+// ============================================================
+const CONFIG = {
+  W: 900, H: 600,
+
+  // Player
+  PLAYER_BASE_SPEED: 165,
+  PLAYER_ACCEL: 950,
+  PLAYER_FRICTION: 0.87,
+  PLAYER_DASH_SPEED_MULT: 2.6,
+  PLAYER_DASH_DURATION: 0.28,
+  PLAYER_DASH_COOLDOWN: 4.0,
+  PLAYER_RADIUS: 14,
+  PLAYER_CLICK_ARRIVE_DIST: 8,
+
+  // Stash tree — the hollow interaction point
+  STASH_X: 78,
+  STASH_Y: 198,
+  STASH_INTERACT_RADIUS: 52,
+
+  // Acorns
+  ACORN_RADIUS: 11,
+  ACORN_SPAWN_BASE_INTERVAL: 3.5,
+  ACORN_TIMER_BASE: 10.0,
+  ACORN_GOLDEN_CHANCE: 0.15,
+  ACORN_GOLDEN_TIMER: 15.0,
+  ACORN_MAX_BASE: 4,
+  ACORN_POINTS: 10,
+  ACORN_GOLDEN_POINTS: 30,
+  ACORN_EXPIRE_PENALTY: 5,
+
+  // Raccoon
+  RACCOON_SPEED_BASE: 62,
+  RACCOON_RADIUS: 19,
+  RACCOON_START_DELAY: 15.0,
+  RACCOON_STEAL_INTERVAL: 2.0,
+  RACCOON_FLEE_RANGE: 115,
+  RACCOON_COOLDOWN_BASE: 8.0,
+
+  // Chipmunk
+  CHIPMUNK_SPEED_BASE: 92,
+  CHIPMUNK_RADIUS: 13,
+  CHIPMUNK_START_LEVEL: 4,
+  CHIPMUNK_COOLDOWN_BASE: 6.0,
+
+  // Power-ups
+  POWERUP_SPAWN_MIN: 30,
+  POWERUP_SPAWN_MAX: 45,
+  POWERUP_MINT_DURATION: 20,
+  POWERUP_ENERGY_DURATION: 15,
+  POWERUP_ENERGY_SPEED_MULT: 2.0,
+  POWERUP_RADIUS: 14,
+
+  // Difficulty / timing
+  LEVEL_UP_INTERVAL: 60,
+  LEVEL_UP_BANNER_DURATION: 2.8,
+
+  // Win / lose
+  WIN_STASH: 50,
+  MAX_STRIKES: 3,
+
+  // HUD thresholds
+  THIEF_WARNING_RANGE: 200,
+  THIEF_WARNING_STASH_RANGE: 160,
+  FLASHING_BORDER_STASH_RANGE: 90,
+
+  // Player dash — minimum velocity before defaulting to facing direction
+  PLAYER_DASH_MIN_VELOCITY: 10,
+};
+
+// ============================================================
+// Canvas Setup & scaling
+// ============================================================
+const canvas = document.getElementById('gc');
+const ctx = canvas.getContext('2d');
+canvas.width  = CONFIG.W;
+canvas.height = CONFIG.H;
+
+let canvasScale = 1, canvasOffsetX = 0, canvasOffsetY = 0;
+
+function resizeCanvas() {
+  const sw = window.innerWidth  / CONFIG.W;
+  const sh = window.innerHeight / CONFIG.H;
+  canvasScale = Math.min(sw, sh);
+  const dw = Math.floor(CONFIG.W * canvasScale);
+  const dh = Math.floor(CONFIG.H * canvasScale);
+  canvas.style.width  = dw + 'px';
+  canvas.style.height = dh + 'px';
+  canvasOffsetX = (window.innerWidth  - dw) / 2;
+  canvasOffsetY = (window.innerHeight - dh) / 2;
+  canvas.style.left = canvasOffsetX + 'px';
+  canvas.style.top  = canvasOffsetY + 'px';
+}
+window.addEventListener('resize', resizeCanvas);
+resizeCanvas();
+
+function screenToCanvas(sx, sy) {
+  return { x: (sx - canvasOffsetX) / canvasScale,
+           y: (sy - canvasOffsetY) / canvasScale };
+}
+
+// ============================================================
+// Web Audio API — all sounds generated procedurally
+// ============================================================
+let audioCtx = null;
+function getAC() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  return audioCtx;
+}
+
+/**
+ * Play a simple oscillator note.
+ * @param {number} freq  Starting frequency (Hz)
+ * @param {number} dur   Duration (seconds)
+ * @param {string} type  OscillatorType
+ * @param {number} vol   Peak gain
+ * @param {number|null} freqEnd  End frequency for sweep (null = no sweep)
+ * @param {number} delay Offset from now (seconds)
+ */
+function playNote(freq, dur, type = 'sine', vol = 0.25, freqEnd = null, delay = 0) {
+  try {
+    const ac = getAC();
+    const osc = ac.createOscillator();
+    const g   = ac.createGain();
+    osc.connect(g);
+    g.connect(ac.destination);
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, ac.currentTime + delay);
+    if (freqEnd !== null) {
+      osc.frequency.exponentialRampToValueAtTime(
+        Math.max(freqEnd, 1), ac.currentTime + delay + dur);
+    }
+    g.gain.setValueAtTime(vol, ac.currentTime + delay);
+    g.gain.exponentialRampToValueAtTime(0.001, ac.currentTime + delay + dur);
+    osc.start(ac.currentTime + delay);
+    osc.stop(ac.currentTime + delay + dur + 0.01);
+  } catch (e) { console.warn('Web Audio error:', e); }
+}
+
+const SFX = {
+  collect()       { playNote(500,0.07,'sine',0.28); playNote(700,0.07,'sine',0.22,null,0.07); playNote(950,0.10,'sine',0.18,null,0.14); },
+  deposit()       { playNote(280,0.05,'triangle',0.38); playNote(420,0.10,'sine',0.45,null,0.05); playNote(560,0.16,'sine',0.32,null,0.15); },
+  thiefApproach() { playNote(155,0.45,'sawtooth',0.07,100); },
+  thiefScared()   { playNote(680,0.32,'sawtooth',0.28,75); },
+  levelUp()       { [523,659,784,1047].forEach((f,i) => playNote(f,0.17,'square',0.18,null,i*0.13)); },
+  acornLost()     { playNote(430,0.05,'sine',0.20); playNote(210,0.14,'sine',0.13,null,0.05); },
+  powerUp()       { playNote(760,0.08,'sine',0.28); playNote(1020,0.08,'sine',0.22,null,0.08); playNote(1280,0.13,'sine',0.18,null,0.16); },
+  steal()         { playNote(190,0.22,'sawtooth',0.14,140); },
+  dash()          { playNote(550,0.14,'square',0.09,950); },
+};
+
+// ============================================================
+// Input handler — keyboard + mouse
+// ============================================================
+const INPUT = {
+  keys: {},
+  mouse: { clicked: false, clickX: 0, clickY: 0 },
+};
+
+window.addEventListener('keydown', e => {
+  INPUT.keys[e.code] = true;
+  // Pause / unpause
+  if (e.code === 'Escape' || e.code === 'KeyP') {
+    if (GS.screen === 'PLAYING' || GS.screen === 'LEVEL_UP_BANNER') {
+      GS.prevScreen = GS.screen;
+      GS.screen = 'PAUSED';
+    } else if (GS.screen === 'PAUSED') {
+      GS.screen = GS.prevScreen;
+    }
+  }
+  // Prevent scroll on arrow / space
+  if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Space'].includes(e.code)) e.preventDefault();
+});
+window.addEventListener('keyup', e => { delete INPUT.keys[e.code]; });
+
+canvas.addEventListener('click', e => {
+  const pos = screenToCanvas(e.clientX, e.clientY);
+  INPUT.mouse.clickX = pos.x;
+  INPUT.mouse.clickY = pos.y;
+  INPUT.mouse.clicked = true;
+  // Advance screens
+  if (GS.screen === 'START_SCREEN')         { startGame(); }
+  else if (GS.screen === 'GAME_OVER')       { startGame(); }
+  else if (GS.screen === 'VICTORY')         { startGame(); }
+});
+
+// ============================================================
+// Utility helpers
+// ============================================================
+const dist     = (x1,y1,x2,y2) => Math.sqrt((x2-x1)**2+(y2-y1)**2);
+const clamp    = (v,lo,hi)      => Math.max(lo, Math.min(hi, v));
+const randF    = (lo,hi)        => lo + Math.random()*(hi-lo);
+const choose   = arr            => arr[Math.floor(Math.random()*arr.length)];
+
+// ============================================================
+// Particle System
+// ============================================================
+class Particle {
+  constructor(x, y, color, vx, vy, size, life) {
+    this.x = x; this.y = y;
+    this.color = color;
+    this.vx = vx; this.vy = vy;
+    this.size = size;
+    this.life = life; this.maxLife = life;
+    this.gravity = 160;
+  }
+  update(dt) {
+    this.x  += this.vx * dt;
+    this.y  += this.vy * dt;
+    this.vy += this.gravity * dt;
+    this.life -= dt;
+  }
+  draw() {
+    const a = Math.max(0, this.life / this.maxLife);
+    ctx.globalAlpha = a;
+    ctx.fillStyle = this.color;
+    ctx.beginPath();
+    ctx.arc(this.x, this.y, Math.max(0.5, this.size * a), 0, Math.PI*2);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+  get dead() { return this.life <= 0; }
+}
+
+function spawnPop(x, y, color = '#c8a000', count = 10) {
+  for (let i = 0; i < count; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const spd   = randF(30, 130);
+    GS.particles.push(new Particle(x, y, color,
+      Math.cos(angle)*spd, Math.sin(angle)*spd - 65,
+      randF(2, 5), randF(0.4, 0.9)));
+  }
+}
+function spawnSparkle(x, y, count = 12) {
+  const cols = ['#FFD700','#FFF700','#FF8C00','#FFFFFF','#FFFACD'];
+  for (let i = 0; i < count; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const spd   = randF(45, 160);
+    GS.particles.push(new Particle(x, y, choose(cols),
+      Math.cos(angle)*spd, Math.sin(angle)*spd - 85,
+      randF(2, 6), randF(0.5, 1.0)));
+  }
+}
+function spawnFirework(x, y) {
+  const cols = ['#FF0000','#FF6600','#FFFF00','#00FF00','#00FFFF','#0088FF','#FF00FF','#FFFFFF'];
+  for (let i = 0; i < 32; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const spd   = randF(90, 260);
+    GS.particles.push(new Particle(x, y, choose(cols),
+      Math.cos(angle)*spd, Math.sin(angle)*spd - 110,
+      randF(3, 7), randF(0.8, 1.5)));
+  }
+}
+
+// ============================================================
+// Acorn class
+// ============================================================
+class Acorn {
+  constructor(x, y, golden, timer) {
+    this.x = x; this.y = y;
+    this.golden   = golden;
+    this.maxTimer = timer;
+    this.timer    = timer;
+    this.sparkleT = Math.random() * Math.PI * 2; // phase for sparkle animation
+  }
+  get points() { return this.golden ? CONFIG.ACORN_GOLDEN_POINTS : CONFIG.ACORN_POINTS; }
+}
+
+// ============================================================
+// PowerUp class
+// ============================================================
+const POWERUP_TYPES = ['bell', 'mint', 'energy', 'twig'];
+
+class PowerUp {
+  constructor(x, y, type) {
+    this.x = x; this.y = y;
+    this.type    = type;
+    this.collected = false;
+    this.bobT    = Math.random() * Math.PI * 2;
+  }
+  update(dt) { this.bobT += dt * 2.2; }
+}
+
+// ============================================================
+// Player (Squirrel) class
+// ============================================================
+class Player {
+  constructor() {
+    this.x = CONFIG.STASH_X + 130;
+    this.y = CONFIG.STASH_Y + 60;
+    this.vx = 0; this.vy = 0;
+    this.holdingAcorn = null;   // Acorn instance or null
+    this.dashActive   = false;
+    this.dashTimer    = 0;
+    this.dashCooldown = 0;
+    this.dashDirX = 0; this.dashDirY = 1;
+    this.walkFrame = 0;
+    this.walkT     = 0;
+    this.targetX   = null; this.targetY = null;
+    this.facing    = 1;    // 1=right, -1=left
+    this.energyActive = false;
+    this.energyTimer  = 0;
+  }
+
+  get speed() {
+    return CONFIG.PLAYER_BASE_SPEED * (this.energyActive ? CONFIG.POWERUP_ENERGY_SPEED_MULT : 1);
+  }
+
+  get radius() { return CONFIG.PLAYER_RADIUS; }
+
+  update(dt) {
+    // Energy Nut timer
+    if (this.energyActive) {
+      this.energyTimer -= dt;
+      if (this.energyTimer <= 0) this.energyActive = false;
+    }
+
+    // Dash cooldown
+    if (this.dashCooldown > 0) this.dashCooldown -= dt;
+
+    // Consume click
+    if (INPUT.mouse.clicked) {
+      this.targetX = INPUT.mouse.clickX;
+      this.targetY = INPUT.mouse.clickY;
+      INPUT.mouse.clicked = false;
+    }
+
+    // ---- Movement ----
+    let ax = 0, ay = 0;
+    if (INPUT.keys['KeyW'] || INPUT.keys['ArrowUp'])    ay = -1;
+    if (INPUT.keys['KeyS'] || INPUT.keys['ArrowDown'])  ay =  1;
+    if (INPUT.keys['KeyA'] || INPUT.keys['ArrowLeft'])  ax = -1;
+    if (INPUT.keys['KeyD'] || INPUT.keys['ArrowRight']) ax =  1;
+
+    // Keyboard cancels click target
+    if (ax !== 0 || ay !== 0) { this.targetX = null; }
+
+    // Click-to-move target steering
+    if (this.targetX !== null) {
+      const dx = this.targetX - this.x;
+      const dy = this.targetY - this.y;
+      const d  = Math.sqrt(dx*dx + dy*dy);
+      if (d < CONFIG.PLAYER_CLICK_ARRIVE_DIST) {
+        this.targetX = null;
+      } else {
+        ax = dx/d; ay = dy/d;
+      }
+    }
+
+    // Dash initiation (Shift)
+    if ((INPUT.keys['ShiftLeft'] || INPUT.keys['ShiftRight']) && this.dashCooldown <= 0 && !this.dashActive) {
+      let ddx = this.vx, ddy = this.vy;
+      const dv = Math.sqrt(ddx*ddx + ddy*ddy);
+      if (dv < CONFIG.PLAYER_DASH_MIN_VELOCITY) { ddx = this.facing; ddy = 0; }
+      else { ddx /= dv; ddy /= dv; }
+      this.dashActive = true;
+      this.dashTimer  = CONFIG.PLAYER_DASH_DURATION;
+      this.dashCooldown = CONFIG.PLAYER_DASH_COOLDOWN;
+      this.dashDirX = ddx; this.dashDirY = ddy;
+      SFX.dash();
+    }
+
+    if (this.dashActive) {
+      this.dashTimer -= dt;
+      const dashSpd = this.speed * CONFIG.PLAYER_DASH_SPEED_MULT;
+      this.vx = this.dashDirX * dashSpd;
+      this.vy = this.dashDirY * dashSpd;
+      if (this.dashTimer <= 0) {
+        this.dashActive = false;
+        this.vx = this.dashDirX * this.speed;
+        this.vy = this.dashDirY * this.speed;
+      }
+    } else {
+      // Normalize diagonal
+      if (ax !== 0 && ay !== 0) { ax *= 0.7071; ay *= 0.7071; }
+
+      if (ax !== 0 || ay !== 0) {
+        this.vx += ax * CONFIG.PLAYER_ACCEL * dt;
+        this.vy += ay * CONFIG.PLAYER_ACCEL * dt;
+        if (ax > 0.1) this.facing = 1;
+        if (ax < -0.1) this.facing = -1;
+        const v = Math.sqrt(this.vx*this.vx + this.vy*this.vy);
+        if (v > this.speed) {
+          this.vx = (this.vx/v) * this.speed;
+          this.vy = (this.vy/v) * this.speed;
+        }
+      } else {
+        const friction = Math.pow(CONFIG.PLAYER_FRICTION, dt * 60);
+        this.vx *= friction;
+        this.vy *= friction;
+        if (Math.abs(this.vx) < 1) this.vx = 0;
+        if (Math.abs(this.vy) < 1) this.vy = 0;
+      }
+    }
+
+    // Integrate position
+    this.x += this.vx * dt;
+    this.y += this.vy * dt;
+    this.x = clamp(this.x, this.radius, CONFIG.W - this.radius);
+    this.y = clamp(this.y, this.radius, CONFIG.H - this.radius);
+
+    // Walk animation
+    const moving = Math.abs(this.vx) > 5 || Math.abs(this.vy) > 5;
+    if (moving) {
+      this.walkT += dt * 9;
+      this.walkFrame = Math.floor(this.walkT) % 2;
+    }
+  }
+}
+
+// ============================================================
+// Thief base — Raccoon and Chipmunk share this
+// ============================================================
+class Thief {
+  constructor(type) {
+    this.type   = type;          // 'raccoon' | 'chipmunk'
+    this.x      = CONFIG.W + 40;
+    this.y      = randF(120, CONFIG.H - 120);
+    this.state  = 'incoming';    // incoming | stealing | fleeing | offscreen
+    this.active = true;
+    this.stealTimer = 0;
+    this.walkFrame  = 0;
+    this.walkT      = 0;
+    this.facing     = -1;        // approaching from right, so face left
+    this.shakeT     = 0;         // for stealing animation
+  }
+
+  get speed() {
+    const lvl = GS.level;
+    return this.type === 'raccoon'
+      ? CONFIG.RACCOON_SPEED_BASE   * (1 + (lvl - 1) * 0.15)
+      : CONFIG.CHIPMUNK_SPEED_BASE  * (1 + (lvl - 4) * 0.12);
+  }
+
+  get radius() {
+    return this.type === 'raccoon' ? CONFIG.RACCOON_RADIUS : CONFIG.CHIPMUNK_RADIUS;
+  }
+
+  get stealInterval() {
+    return Math.max(0.5, CONFIG.RACCOON_STEAL_INTERVAL - (GS.level - 1) * 0.18);
+  }
+
+  distToStash() {
+    return dist(this.x, this.y, CONFIG.STASH_X, CONFIG.STASH_Y);
+  }
+
+  update(dt) {
+    this.walkT += dt * 7;
+    this.walkFrame = Math.floor(this.walkT) % 2;
+
+    const toPlayer = dist(this.x, this.y, GS.player.x, GS.player.y);
+    const mintOn   = GS.mintSprigActive > 0;
+
+    if (this.state === 'incoming') {
+      // If mint sprig is active, flee immediately
+      if (mintOn) { this.scare(); return; }
+
+      // Move toward stash
+      const dx = CONFIG.STASH_X - this.x;
+      const dy = CONFIG.STASH_Y - this.y;
+      const d  = Math.sqrt(dx*dx + dy*dy);
+      if (d > 4) {
+        this.x += (dx/d) * this.speed * dt;
+        this.y += (dy/d) * this.speed * dt;
+        this.facing = dx >= 0 ? 1 : -1;
+      }
+
+      // Flee if player is close
+      if (toPlayer < CONFIG.RACCOON_FLEE_RANGE) { this.scare(); return; }
+
+      // Reached stash?
+      if (this.distToStash() < CONFIG.STASH_INTERACT_RADIUS) {
+        this.state = 'stealing';
+        this.stealTimer = this.stealInterval;
+      }
+
+    } else if (this.state === 'stealing') {
+      if (mintOn || toPlayer < CONFIG.RACCOON_FLEE_RANGE) { this.scare(); return; }
+
+      this.shakeT += dt * 12;
+      this.stealTimer -= dt;
+      if (this.stealTimer <= 0) {
+        this.stealTimer = this.stealInterval;
+        this.doSteal();
+      }
+
+      // Drift slowly toward stash hollow
+      const dx = CONFIG.STASH_X - this.x;
+      const dy = CONFIG.STASH_Y - this.y;
+      const d  = Math.sqrt(dx*dx + dy*dy);
+      if (d > 12) {
+        this.x += (dx/d) * 18 * dt;
+        this.y += (dy/d) * 18 * dt;
+      }
+
+    } else if (this.state === 'fleeing') {
+      this.x += this.speed * 1.9 * dt;
+      this.facing = 1;
+      if (this.x > CONFIG.W + 60) {
+        this.state  = 'offscreen';
+        this.active = false;
+      }
+    }
+  }
+
+  scare() {
+    if (this.state !== 'fleeing' && this.state !== 'offscreen') {
+      this.state = 'fleeing';
+      SFX.thiefScared();
+      spawnPop(this.x, this.y, '#777777', 9);
+    }
+  }
+
+  doSteal() {
+    if (GS.stash > 0) {
+      GS.stash--;
+      GS.score = Math.max(0, GS.score - 5);
+      SFX.steal();
+      spawnPop(CONFIG.STASH_X, CONFIG.STASH_Y - 10, '#777777', 7);
+      // If stash emptied, count as a strike
+      if (GS.stash === 0) {
+        GS.strikes++;
+        if (GS.strikes >= CONFIG.MAX_STRIKES) {
+          GS.screen = 'GAME_OVER';
+        } else {
+          this.scare(); // nothing left — flee
+        }
+      }
+    }
+  }
+}
+
+// ============================================================
+// Game State — single object that holds everything
+// ============================================================
+const GS = {
+  screen: 'START_SCREEN',   // START_SCREEN | PLAYING | LEVEL_UP_BANNER | PAUSED | GAME_OVER | VICTORY
+  prevScreen: 'PLAYING',
+  score: 0, stash: 0, strikes: 0,
+  level: 1, levelTimer: 0, totalTime: 0,
+  acorns: [], thieves: [], powerUps: [], particles: [],
+  player: null,
+  acornSpawnTimer: 2.2,
+  powerUpSpawnTimer: randF(CONFIG.POWERUP_SPAWN_MIN, CONFIG.POWERUP_SPAWN_MAX),
+  raccoonActive: false,
+  raccoonCooldown: CONFIG.RACCOON_START_DELAY,
+  chipmunkActive: false,
+  chipmunkCooldown: CONFIG.CHIPMUNK_COOLDOWN_BASE,
+  levelUpBannerTimer: 0,
+  mintSprigActive: 0,
+  twigTrapActive: false,
+  activePowerUp: null,     // { type, timer }
+  shakeOffsetX: 0,         // for tree-shake when being stolen from
+  approachSoundTimer: 0,
+  fireworkTimer: 0,
+  fireworkCount: 0,
+};
+
+function startGame() {
+  Object.assign(GS, {
+    screen: 'PLAYING', prevScreen: 'PLAYING',
+    score: 0, stash: 0, strikes: 0,
+    level: 1, levelTimer: 0, totalTime: 0,
+    acorns: [], thieves: [], powerUps: [], particles: [],
+    player: new Player(),
+    acornSpawnTimer: 2.2,
+    powerUpSpawnTimer: randF(CONFIG.POWERUP_SPAWN_MIN, CONFIG.POWERUP_SPAWN_MAX),
+    raccoonActive: false,
+    raccoonCooldown: CONFIG.RACCOON_START_DELAY,
+    chipmunkActive: false,
+    chipmunkCooldown: CONFIG.CHIPMUNK_COOLDOWN_BASE,
+    levelUpBannerTimer: 0,
+    mintSprigActive: 0,
+    twigTrapActive: false,
+    activePowerUp: null,
+    shakeOffsetX: 0,
+    approachSoundTimer: 0,
+    fireworkTimer: 0,
+    fireworkCount: 0,
+  });
+  if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+}
+
+// ============================================================
+// Difficulty helper — returns per-level values
+// ============================================================
+function getDC() {
+  const lvl = GS.level;
+  return {
+    acornMax:           Math.min(CONFIG.ACORN_MAX_BASE + lvl, 7),
+    acornSpawnInterval: Math.max(1.4, CONFIG.ACORN_SPAWN_BASE_INTERVAL - lvl * 0.28),
+    acornTimer:         Math.max(5,   CONFIG.ACORN_TIMER_BASE - (lvl - 1)),
+    raccoonSpeed:       CONFIG.RACCOON_SPEED_BASE * (1 + (lvl - 1) * 0.15),
+    raccoonCooldown:    Math.max(3,   CONFIG.RACCOON_COOLDOWN_BASE - (lvl - 1) * 0.8),
+    chipmunkCooldown:   Math.max(3,   CONFIG.CHIPMUNK_COOLDOWN_BASE - Math.max(0, lvl - 4) * 0.5),
+  };
+}
+
+// ============================================================
+// Spawning helpers
+// ============================================================
+function spawnAcorn() {
+  const dc     = getDC();
+  const golden = Math.random() < CONFIG.ACORN_GOLDEN_CHANCE;
+  const timer  = golden ? CONFIG.ACORN_GOLDEN_TIMER : dc.acornTimer;
+  let x, y, tries = 0;
+  do {
+    x = randF(120, CONFIG.W - 50);
+    y = randF(50,  CONFIG.H - 55);
+    tries++;
+  } while (dist(x, y, CONFIG.STASH_X, CONFIG.STASH_Y) < 130 && tries < 30);
+  GS.acorns.push(new Acorn(x, y, golden, timer));
+}
+
+function spawnPowerUpItem() {
+  const type = choose(POWERUP_TYPES);
+  let x, y, tries = 0;
+  do {
+    x = randF(130, CONFIG.W - 60);
+    y = randF(60,  CONFIG.H - 60);
+    tries++;
+  } while (dist(x, y, CONFIG.STASH_X, CONFIG.STASH_Y) < 110 && tries < 20);
+  GS.powerUps.push(new PowerUp(x, y, type));
+}
+
+function spawnRaccoon() {
+  const t = new Thief('raccoon');
+  GS.thieves.push(t);
+  GS.raccoonActive = true;
+  SFX.thiefApproach();
+}
+
+function spawnChipmunk() {
+  const t = new Thief('chipmunk');
+  GS.thieves.push(t);
+  GS.chipmunkActive = true;
+}
+
+// ============================================================
+// Power-up activation
+// ============================================================
+function activatePowerUp(type) {
+  SFX.powerUp();
+  spawnSparkle(GS.player.x, GS.player.y, 14);
+  if (type === 'bell') {
+    GS.thieves.forEach(t => t.scare());
+    GS.activePowerUp = { type, timer: 2.5 };
+  } else if (type === 'mint') {
+    GS.mintSprigActive = CONFIG.POWERUP_MINT_DURATION;
+    GS.activePowerUp   = { type, timer: CONFIG.POWERUP_MINT_DURATION };
+    GS.thieves.forEach(t => t.scare());
+  } else if (type === 'energy') {
+    GS.player.energyActive = true;
+    GS.player.energyTimer  = CONFIG.POWERUP_ENERGY_DURATION;
+    GS.activePowerUp = { type, timer: CONFIG.POWERUP_ENERGY_DURATION };
+  } else if (type === 'twig') {
+    GS.twigTrapActive = true;
+    GS.activePowerUp  = { type, timer: 999 };  // stays until triggered
+  }
+}
+
+// ============================================================
+// Main Update — called every frame when PLAYING / LEVEL_UP_BANNER
+// ============================================================
+function updateGame(dt) {
+  // Keep particles running even in VICTORY
+  if (GS.screen === 'VICTORY') {
+    // Periodic fireworks
+    GS.fireworkTimer -= dt;
+    if (GS.fireworkTimer <= 0 && GS.fireworkCount < 40) {
+      spawnFirework(randF(80, CONFIG.W - 80), randF(60, CONFIG.H - 180));
+      GS.fireworkCount++;
+      GS.fireworkTimer = 0.28;
+    }
+    for (const p of GS.particles) p.update(dt);
+    GS.particles = GS.particles.filter(p => !p.dead);
+    return;
+  }
+
+  if (GS.screen === 'PAUSED')  return;
+  if (GS.screen !== 'PLAYING' && GS.screen !== 'LEVEL_UP_BANNER') return;
+
+  // Level-up banner countdown
+  if (GS.screen === 'LEVEL_UP_BANNER') {
+    GS.levelUpBannerTimer -= dt;
+    if (GS.levelUpBannerTimer <= 0) GS.screen = 'PLAYING';
+  }
+
+  GS.totalTime  += dt;
+  GS.levelTimer += dt;
+
+  // Level progression
+  if (GS.levelTimer >= CONFIG.LEVEL_UP_INTERVAL) {
+    GS.level++;
+    GS.levelTimer -= CONFIG.LEVEL_UP_INTERVAL;
+    GS.levelUpBannerTimer = CONFIG.LEVEL_UP_BANNER_DURATION;
+    GS.screen = 'LEVEL_UP_BANNER';
+    SFX.levelUp();
+  }
+
+  // Countdown timers for power-ups
+  if (GS.mintSprigActive > 0) GS.mintSprigActive -= dt;
+  if (GS.activePowerUp) {
+    if (GS.activePowerUp.type !== 'twig') {
+      GS.activePowerUp.timer -= dt;
+      if (GS.activePowerUp.timer <= 0) GS.activePowerUp = null;
+    }
+  }
+
+  // Player update
+  GS.player.update(dt);
+
+  // ------- Acorn spawning -------
+  const dc = getDC();
+  GS.acornSpawnTimer -= dt;
+  if (GS.acornSpawnTimer <= 0 && GS.acorns.length < dc.acornMax) {
+    spawnAcorn();
+    GS.acornSpawnTimer = dc.acornSpawnInterval;
+  }
+
+  // ------- Acorn update + pickup + expiry -------
+  for (let i = GS.acorns.length - 1; i >= 0; i--) {
+    const a = GS.acorns[i];
+    a.timer  -= dt;
+    a.sparkleT += dt * 3;
+
+    // Auto-pickup (only if player not already holding one)
+    if (!GS.player.holdingAcorn &&
+        dist(GS.player.x, GS.player.y, a.x, a.y) < GS.player.radius + CONFIG.ACORN_RADIUS) {
+      GS.player.holdingAcorn = a;
+      GS.acorns.splice(i, 1);
+      SFX.collect();
+      spawnSparkle(a.x, a.y, a.golden ? 16 : 9);
+      continue;
+    }
+
+    // Expire
+    if (a.timer <= 0) {
+      spawnPop(a.x, a.y, a.golden ? '#FFD700' : '#8B4513', 11);
+      SFX.acornLost();
+      GS.score = Math.max(0, GS.score - CONFIG.ACORN_EXPIRE_PENALTY);
+      GS.acorns.splice(i, 1);
+    }
+  }
+
+  // ------- Deposit acorn at stash -------
+  if (GS.player.holdingAcorn &&
+      dist(GS.player.x, GS.player.y, CONFIG.STASH_X, CONFIG.STASH_Y) < CONFIG.STASH_INTERACT_RADIUS) {
+    const acorn = GS.player.holdingAcorn;
+    GS.player.holdingAcorn = null;
+    GS.stash++;
+    GS.score += acorn.points;
+    SFX.deposit();
+    spawnSparkle(CONFIG.STASH_X, CONFIG.STASH_Y - 20, 18);
+
+    // Win check
+    if (GS.stash >= CONFIG.WIN_STASH) {
+      GS.screen = 'VICTORY';
+      GS.fireworkTimer = 0;
+      GS.fireworkCount = 0;
+    }
+  }
+
+  // ------- Power-up spawning -------
+  GS.powerUpSpawnTimer -= dt;
+  if (GS.powerUpSpawnTimer <= 0) {
+    if (GS.powerUps.filter(p => !p.collected).length < 2) spawnPowerUpItem();
+    GS.powerUpSpawnTimer = randF(CONFIG.POWERUP_SPAWN_MIN, CONFIG.POWERUP_SPAWN_MAX);
+  }
+
+  // ------- Power-up update + player pickup -------
+  for (let i = GS.powerUps.length - 1; i >= 0; i--) {
+    const pu = GS.powerUps[i];
+    if (pu.collected) continue;
+    pu.update(dt);
+    if (dist(GS.player.x, GS.player.y, pu.x, pu.y) < GS.player.radius + CONFIG.POWERUP_RADIUS) {
+      pu.collected = true;
+      activatePowerUp(pu.type);
+    }
+  }
+  GS.powerUps = GS.powerUps.filter(p => !p.collected);
+
+  // ------- Raccoon spawn management -------
+  const raccoons = GS.thieves.filter(t => t.type === 'raccoon');
+  if (raccoons.length === 0) {
+    if (GS.raccoonActive) {
+      // Raccoon just left — start cooldown
+      GS.raccoonActive    = false;
+      GS.raccoonCooldown  = getDC().raccoonCooldown;
+    } else {
+      GS.raccoonCooldown -= dt;
+      if (GS.raccoonCooldown <= 0) spawnRaccoon();
+    }
+  }
+
+  // ------- Chipmunk spawn management (level 4+) -------
+  if (GS.level >= CONFIG.CHIPMUNK_START_LEVEL) {
+    const chipmunks = GS.thieves.filter(t => t.type === 'chipmunk');
+    if (chipmunks.length === 0) {
+      if (GS.chipmunkActive) {
+        GS.chipmunkActive   = false;
+        GS.chipmunkCooldown = getDC().chipmunkCooldown;
+      } else {
+        GS.chipmunkCooldown -= dt;
+        if (GS.chipmunkCooldown <= 0) spawnChipmunk();
+      }
+    }
+  }
+
+  // ------- Thief updates -------
+  for (const t of GS.thieves) {
+    if (!t.active) continue;
+    t.update(dt);
+    // Player bumps into thief → scare it away
+    if (dist(GS.player.x, GS.player.y, t.x, t.y) < GS.player.radius + t.radius + 4) {
+      t.scare();
+    }
+  }
+  GS.thieves = GS.thieves.filter(t => t.active);
+
+  // ------- Twig trap: auto-scare thief at stash -------
+  if (GS.twigTrapActive) {
+    const stealing = GS.thieves.filter(t => t.state === 'stealing');
+    if (stealing.length > 0) {
+      stealing.forEach(t => t.scare());
+      GS.twigTrapActive = false;
+      GS.activePowerUp  = null;
+    }
+  }
+
+  // ------- Tree shake (when thief is stealing) -------
+  const anySteal = GS.thieves.some(t => t.state === 'stealing');
+  GS.shakeOffsetX = anySteal ? Math.sin(GS.totalTime * 18) * 3 : 0;
+
+  // ------- Creepy approach sound -------
+  GS.approachSoundTimer -= dt;
+  if (GS.approachSoundTimer <= 0) {
+    const nearStash = GS.thieves.find(t => t.state === 'incoming' &&
+      t.distToStash() < CONFIG.THIEF_WARNING_STASH_RANGE);
+    if (nearStash) { SFX.thiefApproach(); GS.approachSoundTimer = 1.8; }
+    else GS.approachSoundTimer = 0.5;
+  }
+
+  // ------- Particles -------
+  for (const p of GS.particles) p.update(dt);
+  GS.particles = GS.particles.filter(p => !p.dead);
+}
+
+// ============================================================
+// Drawing helpers
+// ============================================================
+
+// Rounded rectangle path helper
+function roundRect(x, y, w, h, r) {
+  r = Math.min(r, w/2, h/2);
+  ctx.beginPath();
+  ctx.moveTo(x+r, y);
+  ctx.arcTo(x+w, y,   x+w, y+h, r);
+  ctx.arcTo(x+w, y+h, x,   y+h, r);
+  ctx.arcTo(x,   y+h, x,   y,   r);
+  ctx.arcTo(x,   y,   x+w, y,   r);
+  ctx.closePath();
+}
+
+// Draw a single acorn (cap + body + stem); golden variant adds sparkles
+function drawAcornShape(x, y, r, golden) {
+  ctx.save();
+  ctx.translate(x, y);
+
+  // Body
+  ctx.fillStyle   = golden ? '#FFD700' : '#8B4513';
+  ctx.strokeStyle = golden ? '#B8860B' : '#5C2900';
+  ctx.lineWidth   = 1.5;
+  ctx.beginPath();
+  ctx.ellipse(0, r*0.15, r*0.62, r*0.88, 0, 0, Math.PI*2);
+  ctx.fill(); ctx.stroke();
+
+  // Cap
+  ctx.fillStyle   = golden ? '#B8860B' : '#4a2500';
+  ctx.beginPath();
+  ctx.ellipse(0, -r*0.35, r*0.72, r*0.48, 0, Math.PI, 0);
+  ctx.fill(); ctx.stroke();
+
+  // Stem
+  ctx.strokeStyle = golden ? '#8B6914' : '#5C2900';
+  ctx.lineWidth   = 1.5;
+  ctx.beginPath();
+  ctx.moveTo(0, -r*0.83); ctx.lineTo(2, -r*1.1);
+  ctx.stroke();
+
+  // Golden sparkle dots
+  if (golden) {
+    ctx.fillStyle = '#FFFACD';
+    for (let i = 0; i < 4; i++) {
+      const a = (i/4) * Math.PI * 2;
+      ctx.beginPath();
+      ctx.arc(Math.cos(a)*r*0.38, r*0.15 + Math.sin(a)*r*0.38, 1.6, 0, Math.PI*2);
+      ctx.fill();
+    }
+  }
+  ctx.restore();
+}
+
+// ============================================================
+// Draw: Squirrel (player)
+// ============================================================
+function drawSquirrel(x, y, facing, walkFrame, holdingAcorn, energyActive) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.scale(facing, 1);
+
+  if (energyActive) { ctx.shadowBlur = 18; ctx.shadowColor = '#FFD700'; }
+
+  const lShift = walkFrame === 0 ? 3 : -3;  // leg/tail wiggle offset
+
+  // Fluffy tail (bezier filled shape)
+  ctx.fillStyle   = '#C68642';
+  ctx.strokeStyle = '#9B5E27';
+  ctx.lineWidth   = 1.8;
+  ctx.beginPath();
+  ctx.moveTo(-4, -3);
+  ctx.bezierCurveTo(-14, -10 + lShift, -26, -24 + lShift, -11, -34);
+  ctx.bezierCurveTo(4,  -42 + lShift,  18,  -28,  9,  -16);
+  ctx.bezierCurveTo(4,  -6,  -2,  -1,  -4,  -3);
+  ctx.fill(); ctx.stroke();
+
+  // Body oval
+  ctx.fillStyle   = '#C68642';
+  ctx.strokeStyle = '#9B5E27';
+  ctx.lineWidth   = 1.5;
+  ctx.beginPath();
+  ctx.ellipse(0, 0, 11, 9, 0, 0, Math.PI*2);
+  ctx.fill(); ctx.stroke();
+
+  // Head
+  ctx.beginPath();
+  ctx.ellipse(10, -7, 8, 7, 0.18, 0, Math.PI*2);
+  ctx.fill(); ctx.stroke();
+
+  // Ears
+  ctx.fillStyle = '#C68642';
+  ctx.beginPath(); ctx.ellipse(7,  -13, 3,  4,  -0.3, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+  ctx.beginPath(); ctx.ellipse(13, -13, 3,  4,   0.3, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+  // Inner ear
+  ctx.fillStyle = '#FFAABB';
+  ctx.beginPath(); ctx.ellipse(7,  -13, 1.5, 2.5, -0.3, 0, Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(13, -13, 1.5, 2.5,  0.3, 0, Math.PI*2); ctx.fill();
+
+  // Eye
+  ctx.fillStyle = '#111';
+  ctx.beginPath(); ctx.arc(13, -8, 2, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#FFF';
+  ctx.beginPath(); ctx.arc(13.8, -8.8, 0.8, 0, Math.PI*2); ctx.fill();
+
+  // Nose
+  ctx.fillStyle = '#FF7070';
+  ctx.beginPath(); ctx.arc(17, -7, 1.4, 0, Math.PI*2); ctx.fill();
+
+  // Legs (two frame walk animation)
+  ctx.fillStyle = '#9B5E27';
+  ctx.beginPath(); ctx.ellipse(-4,  8, 3,  5.5, 0.25 + lShift*0.06, 0, Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(4,   8, 3,  5.5, -0.25 - lShift*0.06, 0, Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(9,   6, 3,  5,    0.2  + lShift*0.04, 0, Math.PI*2); ctx.fill();
+
+  ctx.restore();
+
+  // Held acorn drawn ABOVE squirrel, after restore (so it's not flipped)
+  if (holdingAcorn) {
+    ctx.save();
+    ctx.translate(x, y);
+    drawAcornShape(facing * 3, -26, 9, holdingAcorn.golden);
+    ctx.restore();
+  }
+}
+
+// ============================================================
+// Draw: Raccoon
+// ============================================================
+function drawRaccoon(x, y, facing, walkFrame, shaking) {
+  ctx.save();
+  ctx.translate(x + (shaking ? GS.shakeOffsetX : 0), y);
+  ctx.scale(facing, 1);
+
+  const lShift = walkFrame === 0 ? 3 : -3;
+
+  // Striped tail
+  ctx.fillStyle = '#888';
+  ctx.beginPath();
+  ctx.moveTo(-4, -1);
+  ctx.bezierCurveTo(-16, -6, -28, -15, -20, -26);
+  ctx.bezierCurveTo(-12, -36, 1, -26, -1, -15);
+  ctx.bezierCurveTo(-3, -5, -2, 0, -4, -1);
+  ctx.fill();
+  // Tail stripes
+  ctx.strokeStyle = '#333'; ctx.lineWidth = 2;
+  for (let i = 0; i < 3; i++) {
+    ctx.beginPath();
+    ctx.moveTo(-7 - i*3.5, -7 - i*5);
+    ctx.lineTo(-14 - i*2.5, -11 - i*5);
+    ctx.stroke();
+  }
+
+  // Body
+  ctx.fillStyle   = '#888';
+  ctx.strokeStyle = '#555';
+  ctx.lineWidth   = 1.5;
+  ctx.beginPath(); ctx.ellipse(0, 0, 14, 12, 0, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+
+  // Head
+  ctx.fillStyle = '#888';
+  ctx.beginPath(); ctx.ellipse(11, -6, 11, 10, 0.1, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+
+  // Mask patches (dark rings around eyes)
+  ctx.fillStyle = '#2a2a2a';
+  ctx.beginPath(); ctx.ellipse(8,  -8, 4.5, 3.5, -0.25, 0, Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(15, -8, 4.5, 3.5,  0.25, 0, Math.PI*2); ctx.fill();
+
+  // Eyes
+  ctx.fillStyle = '#FFF';
+  ctx.beginPath(); ctx.arc(8,  -8, 2.5, 0, Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(15, -8, 2.5, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#111';
+  ctx.beginPath(); ctx.arc(8.5,  -8, 1.5, 0, Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(15.5, -8, 1.5, 0, Math.PI*2); ctx.fill();
+
+  // Ears
+  ctx.fillStyle = '#888'; ctx.strokeStyle = '#555';
+  ctx.beginPath(); ctx.ellipse(7,  -15, 3.5, 4.5, -0.2, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+  ctx.beginPath(); ctx.ellipse(15, -15, 3.5, 4.5,  0.2, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+
+  // Nose
+  ctx.fillStyle = '#333';
+  ctx.beginPath(); ctx.arc(19, -5, 2, 0, Math.PI*2); ctx.fill();
+
+  // Legs
+  ctx.fillStyle = '#666';
+  ctx.beginPath(); ctx.ellipse(-5,  9, 4, 6.5, 0.2  + lShift*0.05, 0, Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(5,   9, 4, 6.5, -0.2 - lShift*0.05, 0, Math.PI*2); ctx.fill();
+
+  ctx.restore();
+}
+
+// ============================================================
+// Draw: Chipmunk
+// ============================================================
+function drawChipmunk(x, y, facing, walkFrame) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.scale(facing, 1);
+
+  const lShift = walkFrame === 0 ? 2 : -2;
+
+  // Thin tail
+  ctx.fillStyle = '#C68642';
+  ctx.beginPath();
+  ctx.moveTo(-3, -1);
+  ctx.bezierCurveTo(-10, -6, -18, -14, -12, -22);
+  ctx.bezierCurveTo(-6, -30, 2, -22, 0, -13);
+  ctx.bezierCurveTo(-1, -5, 0, 0, -3, -1);
+  ctx.fill();
+
+  // Body
+  ctx.fillStyle   = '#C68642';
+  ctx.strokeStyle = '#9B5E27';
+  ctx.lineWidth   = 1.4;
+  ctx.beginPath(); ctx.ellipse(0, 0, 9, 7, 0, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+
+  // Back stripes (characteristic of chipmunks)
+  ctx.strokeStyle = '#7a3e18';
+  ctx.lineWidth   = 1.6;
+  ctx.beginPath(); ctx.moveTo(-7, -4); ctx.lineTo(6, -4); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(-6, -1); ctx.lineTo(5, -1); ctx.stroke();
+
+  // Head with large cheeks
+  ctx.fillStyle   = '#C68642';
+  ctx.strokeStyle = '#9B5E27';
+  ctx.beginPath(); ctx.ellipse(8, -5, 9, 8, 0.1, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+
+  // Puffy cheeks
+  ctx.fillStyle = '#DDA070';
+  ctx.beginPath(); ctx.ellipse(13, -4, 4.5, 3.5, 0.1, 0, Math.PI*2); ctx.fill();
+
+  // Ears (small)
+  ctx.fillStyle = '#C68642'; ctx.strokeStyle = '#9B5E27';
+  ctx.beginPath(); ctx.ellipse(5,  -12, 2.5, 3.2, -0.2, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+  ctx.beginPath(); ctx.ellipse(11, -12, 2.5, 3.2,  0.2, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+
+  // Eye
+  ctx.fillStyle = '#111';
+  ctx.beginPath(); ctx.arc(11, -6, 1.8, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#FFF';
+  ctx.beginPath(); ctx.arc(11.7, -6.7, 0.7, 0, Math.PI*2); ctx.fill();
+
+  // Nose
+  ctx.fillStyle = '#FF7070';
+  ctx.beginPath(); ctx.arc(16, -4, 1.3, 0, Math.PI*2); ctx.fill();
+
+  // Legs
+  ctx.fillStyle = '#9B5E27';
+  ctx.beginPath(); ctx.ellipse(-3, 6, 2.5, 4, 0.2  + lShift*0.05, 0, Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(3,  6, 2.5, 4, -0.2 - lShift*0.05, 0, Math.PI*2); ctx.fill();
+
+  ctx.restore();
+}
+
+// ============================================================
+// Draw: PowerUp item
+// ============================================================
+function drawPowerUpItem(pu) {
+  const x = pu.x;
+  const y = pu.y + Math.sin(pu.bobT) * 4.5;
+
+  ctx.save();
+  ctx.translate(x, y);
+
+  if (pu.type === 'bell') {
+    // Gold bell
+    ctx.fillStyle   = '#FFD700';
+    ctx.strokeStyle = '#B8860B';
+    ctx.lineWidth   = 2;
+    ctx.beginPath();
+    ctx.arc(0, -7, 10, Math.PI, 0);
+    ctx.lineTo(11, 2);
+    ctx.arc(0, 2, 11, 0, Math.PI);
+    ctx.closePath();
+    ctx.fill(); ctx.stroke();
+    // Handle
+    ctx.fillStyle = '#B8860B';
+    ctx.fillRect(-2.5, -18, 5, 7);
+    // Bell knob
+    ctx.beginPath(); ctx.arc(0, -18, 3, 0, Math.PI*2); ctx.fill();
+    // Clapper
+    ctx.fillStyle = '#8B6914';
+    ctx.beginPath(); ctx.arc(0, 4, 3, 0, Math.PI*2); ctx.fill();
+
+  } else if (pu.type === 'mint') {
+    // Green mint sprig
+    ctx.strokeStyle = '#1A6B1A';
+    ctx.lineWidth   = 2;
+    ctx.beginPath(); ctx.moveTo(0, 10); ctx.lineTo(0, -12); ctx.stroke();
+    const leafAngles = [-0.55, 0.55, -0.45, 0.45, -0.35, 0.35, 0];
+    const leafY      = [ 8,     8,    3,     3,   -2,    -2,   -8];
+    const leafX      = [-8,     8,   -8,     8,   -7,     7,    0];
+    leafAngles.forEach((a, i) => {
+      ctx.fillStyle = i % 2 === 0 ? '#32CD32' : '#228B22';
+      ctx.beginPath();
+      ctx.ellipse(leafX[i], leafY[i], 7, 3.5, a, 0, Math.PI*2);
+      ctx.fill();
+    });
+
+  } else if (pu.type === 'energy') {
+    // Glowing energy nut
+    ctx.shadowBlur = 18; ctx.shadowColor = '#FFD700';
+    ctx.fillStyle   = '#FFD700';
+    ctx.strokeStyle = '#FF8C00';
+    ctx.lineWidth   = 2;
+    ctx.beginPath(); ctx.ellipse(0, 2, 8, 12, 0, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+    // Cap
+    ctx.fillStyle = '#B8860B';
+    ctx.beginPath(); ctx.ellipse(0, -6, 9, 5, 0, Math.PI, 0); ctx.fill(); ctx.stroke();
+    // Lightning bolt
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = '#FFFFFF';
+    ctx.beginPath();
+    ctx.moveTo(2,-3); ctx.lineTo(-2,2); ctx.lineTo(1,2);
+    ctx.lineTo(-1,8); ctx.lineTo(3,1); ctx.lineTo(0,1);
+    ctx.closePath(); ctx.fill();
+
+  } else if (pu.type === 'twig') {
+    // Brown trap X
+    ctx.lineCap    = 'round';
+    ctx.strokeStyle = '#8B4513'; ctx.lineWidth = 6;
+    ctx.beginPath(); ctx.moveTo(-11,-11); ctx.lineTo(11,11); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(11,-11); ctx.lineTo(-11,11); ctx.stroke();
+    ctx.strokeStyle = '#5C2900'; ctx.lineWidth = 2.5;
+    ctx.beginPath(); ctx.moveTo(-11,-11); ctx.lineTo(11,11); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(11,-11); ctx.lineTo(-11,11); ctx.stroke();
+  }
+
+  ctx.restore();
+
+  // Label
+  ctx.save();
+  ctx.font        = '9px sans-serif';
+  ctx.textAlign   = 'center';
+  ctx.fillStyle   = '#FFF';
+  ctx.shadowBlur  = 4; ctx.shadowColor = '#000';
+  const labels = { bell:'Bell', mint:'Mint', energy:'Energy', twig:'Trap' };
+  ctx.fillText(labels[pu.type], x, y + 20);
+  ctx.restore();
+}
+
+// ============================================================
+// Draw: Stash tree (large oak, top-left)
+// ============================================================
+function drawStashTree() {
+  const tx = CONFIG.STASH_X + GS.shakeOffsetX;
+  const ty = CONFIG.STASH_Y;
+
+  // Ground shadow
+  ctx.fillStyle = 'rgba(0,0,0,0.18)';
+  ctx.beginPath(); ctx.ellipse(tx, ty+122, 33, 9, 0, 0, Math.PI*2); ctx.fill();
+
+  // Trunk
+  ctx.fillStyle   = '#8B5E3C';
+  ctx.strokeStyle = '#5C3317';
+  ctx.lineWidth   = 2;
+  ctx.beginPath();
+  ctx.moveTo(tx-22, ty+122);
+  ctx.bezierCurveTo(tx-20, ty+70, tx-18, ty+30, tx-16, ty+18);
+  ctx.lineTo(tx+16, ty+18);
+  ctx.bezierCurveTo(tx+18, ty+30, tx+20, ty+70, tx+22, ty+122);
+  ctx.closePath();
+  ctx.fill(); ctx.stroke();
+
+  // Trunk texture
+  ctx.strokeStyle = 'rgba(0,0,0,0.2)'; ctx.lineWidth = 1;
+  for (let i = 0; i < 5; i++) {
+    ctx.beginPath();
+    ctx.moveTo(tx - 14 + i*6, ty+24);
+    ctx.bezierCurveTo(tx-12+i*6, ty+60, tx-13+i*5.5, ty+90, tx-14+i*5, ty+118);
+    ctx.stroke();
+  }
+
+  // Canopy — layered green circles for a lush oak look
+  const canopyLayers = [
+    { ox: 0,   oy: -82, r: 55, c: '#2D5A1B' },
+    { ox: -28, oy: -60, r: 38, c: '#3A7A24' },
+    { ox:  28, oy: -60, r: 38, c: '#3A7A24' },
+    { ox:  0,  oy: -105,r: 42, c: '#3A7A24' },
+    { ox: -15, oy: -90, r: 30, c: '#4CAF50' },
+    { ox:  18, oy: -95, r: 28, c: '#4CAF50' },
+    { ox:  0,  oy: -68, r: 24, c: '#245A16' },
+  ];
+  ctx.strokeStyle = '#1A3A0E'; ctx.lineWidth = 1.5;
+  for (const l of canopyLayers) {
+    ctx.fillStyle = l.c;
+    ctx.beginPath(); ctx.arc(tx + l.ox, ty + l.oy, l.r, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+  }
+
+  // Tree hollow (dark oval in trunk)
+  const hollowX = tx;
+  const hollowY = ty + 40;
+  // Hollow outline glow when thief is stealing
+  if (GS.thieves.some(t => t.state === 'stealing')) {
+    ctx.shadowBlur  = 12; ctx.shadowColor = '#FF4400';
+  }
+  ctx.fillStyle   = '#1a0e05';
+  ctx.strokeStyle = '#5C3317';
+  ctx.lineWidth   = 2.5;
+  ctx.beginPath(); ctx.ellipse(hollowX, hollowY, 19, 15, 0, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+  ctx.shadowBlur  = 0;
+
+  // Acorn count displayed inside hollow
+  ctx.fillStyle      = '#FFD700';
+  ctx.font           = 'bold 13px sans-serif';
+  ctx.textAlign      = 'center';
+  ctx.textBaseline   = 'middle';
+  ctx.fillText(GS.stash, hollowX, hollowY + 1);
+
+  // Small acorn icon to the left of hollow
+  ctx.save(); ctx.translate(tx - 31, hollowY - 4); drawAcornShape(0, 0, 7, false); ctx.restore();
+}
+
+// ============================================================
+// Draw: Background (sky, ground, trees, clouds, flowers)
+// ============================================================
+
+// Pre-build decorative tree data so it's consistent across frames
+const DECO_TREES = [
+  { x:245, r:28 }, { x:450, r:24 }, { x:680, r:34 },
+  { x:820, r:22 }, { x:158, r:17 }, { x:555, r:20 }, { x:770, r:16 },
+];
+const FLOWERS = [290, 380, 490, 615, 745, 845];
+
+function drawDecorTree(x, baseY, r) {
+  ctx.fillStyle = '#7B4B2A';
+  ctx.beginPath(); ctx.rect(x-4, baseY-r*2.6, 8, r*2.6); ctx.fill();
+  ctx.fillStyle   = '#388E3C';
+  ctx.strokeStyle = '#245A16'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.arc(x, baseY-r*2.6, r, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+  ctx.fillStyle = '#4CAF50';
+  ctx.beginPath(); ctx.arc(x - r*0.3, baseY - r*2.9, r*0.7, 0, Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(x + r*0.3, baseY - r*2.9, r*0.7, 0, Math.PI*2); ctx.fill();
+}
+
+function drawCloud(x, y, w) {
+  ctx.fillStyle = 'rgba(255,255,255,0.82)';
+  [[0,0,w*0.3],[w*0.32,5,w*0.24],[-w*0.22,6,w*0.2],[w*0.16,-5,w*0.22]].forEach(([ox,oy,r]) => {
+    ctx.beginPath(); ctx.arc(x+ox, y+oy, r, 0, Math.PI*2); ctx.fill();
+  });
+}
+
+function drawFlower(x, y) {
+  ctx.fillStyle = '#FFD700';
+  ctx.beginPath(); ctx.arc(x, y, 3.5, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#FF69B4';
+  for (let i = 0; i < 5; i++) {
+    const a = (i/5)*Math.PI*2;
+    ctx.beginPath(); ctx.arc(x+Math.cos(a)*5, y+Math.sin(a)*5, 2.8, 0, Math.PI*2); ctx.fill();
+  }
+  ctx.fillStyle = '#FFD700';
+  ctx.beginPath(); ctx.arc(x, y, 3.5, 0, Math.PI*2); ctx.fill();
+}
+
+function drawBackground() {
+  // Sky gradient
+  const skyG = ctx.createLinearGradient(0, 0, 0, CONFIG.H * 0.68);
+  skyG.addColorStop(0,   '#6AACDE');
+  skyG.addColorStop(0.55,'#A8D8F0');
+  skyG.addColorStop(1,   '#C8EDCC');
+  ctx.fillStyle = skyG; ctx.fillRect(0, 0, CONFIG.W, CONFIG.H);
+
+  // Clouds
+  drawCloud(195, 55,  80); drawCloud(490, 38, 100);
+  drawCloud(740, 70,  70); drawCloud(340, 95,  62);
+
+  // Ground strip
+  const gY = CONFIG.H - 102;
+  const gGrad = ctx.createLinearGradient(0, gY, 0, CONFIG.H);
+  gGrad.addColorStop(0,   '#52B040');
+  gGrad.addColorStop(0.35,'#3D8E30');
+  gGrad.addColorStop(1,   '#2E6B24');
+  ctx.fillStyle = gGrad; ctx.fillRect(0, gY, CONFIG.W, CONFIG.H - gY);
+
+  // Ground edge line
+  ctx.strokeStyle = '#2D6020'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(0, gY); ctx.lineTo(CONFIG.W, gY); ctx.stroke();
+
+  // Decorative trees
+  for (const dt of DECO_TREES) drawDecorTree(dt.x, gY, dt.r);
+
+  // Grass tufts
+  ctx.strokeStyle = '#2D6020'; ctx.lineWidth = 1.5;
+  for (let gx = 12; gx < CONFIG.W; gx += 16) {
+    ctx.beginPath(); ctx.moveTo(gx,   gY); ctx.lineTo(gx-3,   gY-7); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(gx+5, gY); ctx.lineTo(gx+5,   gY-9); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(gx+9, gY); ctx.lineTo(gx+12,  gY-6); ctx.stroke();
+  }
+
+  // Flowers
+  for (const fx of FLOWERS) drawFlower(fx, gY - 2);
+}
+
+// ============================================================
+// Draw: Acorn on ground with timer ring
+// ============================================================
+function drawAcornOnGround(acorn) {
+  const x = acorn.x, y = acorn.y;
+  const pct = acorn.timer / acorn.maxTimer;
+
+  // Timer ring hue: 120=green → 60=yellow → 0=red
+  const hue = pct * 120;
+  const ringColor = `hsl(${hue}, 100%, 38%)`;
+
+  // Shadow ring (track)
+  ctx.strokeStyle = 'rgba(0,0,0,0.18)';
+  ctx.lineWidth   = 3.5;
+  ctx.beginPath(); ctx.arc(x, y, CONFIG.ACORN_RADIUS + 6, 0, Math.PI*2); ctx.stroke();
+
+  // Countdown arc (fills clockwise from top)
+  ctx.strokeStyle = ringColor;
+  ctx.lineWidth   = 3.5;
+  ctx.beginPath();
+  ctx.arc(x, y, CONFIG.ACORN_RADIUS + 6, -Math.PI/2, -Math.PI/2 + Math.PI*2*pct);
+  ctx.stroke();
+
+  // Golden sparkle animation
+  if (acorn.golden) {
+    ctx.fillStyle = 'rgba(255,215,0,0.7)';
+    for (let i = 0; i < 4; i++) {
+      const a = acorn.sparkleT + (i/4)*Math.PI*2;
+      ctx.beginPath();
+      ctx.arc(x + Math.cos(a)*(CONFIG.ACORN_RADIUS + 9),
+              y + Math.sin(a)*(CONFIG.ACORN_RADIUS + 9), 2.5, 0, Math.PI*2);
+      ctx.fill();
+    }
+  }
+
+  drawAcornShape(x, y, CONFIG.ACORN_RADIUS, acorn.golden);
+}
+
+// ============================================================
+// Draw: HUD overlay
+// ============================================================
+function drawHUD() {
+  // Top bar background
+  ctx.fillStyle = 'rgba(0,0,0,0.38)';
+  ctx.fillRect(0, 0, CONFIG.W, 42);
+
+  // --- Stash count (top left) ---
+  ctx.fillStyle    = '#FFF';
+  ctx.font         = 'bold 13px sans-serif';
+  ctx.textAlign    = 'left';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('Stash:', 8, 21);
+  ctx.save(); ctx.translate(70, 21); drawAcornShape(0, 0, 7, false); ctx.restore();
+  ctx.fillStyle = '#FFD700';
+  ctx.font      = 'bold 16px sans-serif';
+  ctx.fillText(GS.stash, 85, 21);
+
+  // --- Level & timer (top centre) ---
+  ctx.fillStyle  = '#FFF';
+  ctx.font       = 'bold 13px sans-serif';
+  ctx.textAlign  = 'center';
+  ctx.fillText(`Level ${GS.level}`, CONFIG.W/2, 13);
+  const mins = Math.floor(GS.totalTime/60).toString().padStart(2,'0');
+  const secs = Math.floor(GS.totalTime%60).toString().padStart(2,'0');
+  ctx.font      = '11px sans-serif';
+  ctx.fillStyle = '#CCDDFF';
+  ctx.fillText(`${mins}:${secs}`, CONFIG.W/2, 30);
+
+  // --- Score (top right) ---
+  ctx.textAlign = 'right';
+  ctx.fillStyle = '#FFD700';
+  ctx.font      = 'bold 14px sans-serif';
+  ctx.fillText(`Score: ${GS.score}`, CONFIG.W - 10, 13);
+
+  // --- Strike icons (3 acorns, greyed when used) ---
+  for (let i = 0; i < CONFIG.MAX_STRIKES; i++) {
+    ctx.save();
+    ctx.globalAlpha = i < GS.strikes ? 0.25 : 1;
+    ctx.translate(CONFIG.W - 58 + i*21, 30);
+    drawAcornShape(0, 0, 7, false);
+    ctx.restore();
+  }
+
+  // --- Dash cooldown bar (bottom centre) ---
+  const dashReady = GS.player.dashCooldown <= 0;
+  const dashFrac  = dashReady ? 1 : 1 - GS.player.dashCooldown / CONFIG.PLAYER_DASH_COOLDOWN;
+  const bW = 110, bH = 11, bX = CONFIG.W/2 - bW/2, bY = CONFIG.H - 26;
+  ctx.fillStyle = 'rgba(0,0,0,0.55)';
+  roundRect(bX-2, bY-2, bW+4, bH+4, 6); ctx.fill();
+  ctx.fillStyle = dashReady ? '#00AAFF' : '#005588';
+  roundRect(bX, bY, bW * dashFrac, bH, 4); ctx.fill();
+  ctx.fillStyle    = '#FFF';
+  ctx.font         = '8px sans-serif';
+  ctx.textAlign    = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(dashReady ? 'DASH READY' : 'DASH', CONFIG.W/2, bY + bH/2 + 0.5);
+
+  // --- Active power-up display (right side) ---
+  if (GS.activePowerUp) {
+    const ap = GS.activePowerUp;
+    const apX = CONFIG.W - 10, apY = 52;
+    ctx.fillStyle = 'rgba(0,0,0,0.55)';
+    roundRect(apX - 88, apY, 88, 38, 7); ctx.fill();
+    const apNames = { bell:'[Bell] Bell!', mint:'[Mint] Mint Sprig', energy:'[Nrg] Energy Nut', twig:'[X] Twig Trap' };
+    ctx.fillStyle    = '#FFD700';
+    ctx.font         = 'bold 11px sans-serif';
+    ctx.textAlign    = 'right';
+    ctx.textBaseline = 'top';
+    ctx.fillText(apNames[ap.type], apX - 6, apY + 5);
+    if (ap.type !== 'twig') {
+      ctx.fillStyle = '#88FF88';
+      ctx.font      = '10px sans-serif';
+      ctx.fillText(Math.ceil(ap.timer) + 's', apX - 6, apY + 21);
+    } else {
+      ctx.fillStyle = '#FF8888';
+      ctx.fillText('active', apX - 6, apY + 21);
+    }
+  }
+
+  // --- Thief incoming flashing red border ---
+  const thiefNearStash = GS.thieves.some(t =>
+    t.active && t.distToStash() < CONFIG.FLASHING_BORDER_STASH_RANGE && t.state !== 'fleeing');
+  if (thiefNearStash) {
+    const flashAlpha = (Math.sin(GS.totalTime * 8) + 1) * 0.4;
+    ctx.strokeStyle = `rgba(255,0,0,${flashAlpha + 0.3})`;
+    ctx.lineWidth   = 7;
+    ctx.strokeRect(3, 3, CONFIG.W - 6, CONFIG.H - 6);
+  }
+
+  // --- Click-to-move target indicator ---
+  const pl = GS.player;
+  if (pl.targetX !== null) {
+    ctx.strokeStyle = 'rgba(255,255,255,0.55)';
+    ctx.lineWidth   = 1.5;
+    const r = 8 + Math.sin(GS.totalTime * 6) * 2;
+    ctx.beginPath(); ctx.arc(pl.targetX, pl.targetY, r, 0, Math.PI*2); ctx.stroke();
+  }
+}
+
+// ============================================================
+// Draw: Thief warning indicators
+// ============================================================
+function drawThiefWarnings() {
+  for (const t of GS.thieves) {
+    if (!t.active) continue;
+    const dPlayer = dist(t.x, t.y, GS.player.x, GS.player.y);
+
+    // "!" exclamation when player is nearby
+    if (dPlayer < CONFIG.THIEF_WARNING_RANGE && t.state !== 'fleeing') {
+      const pulse = 0.7 + Math.sin(GS.totalTime * 10) * 0.3;
+      ctx.fillStyle = `rgba(255,40,40,${pulse})`;
+      ctx.font      = 'bold 20px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('!', t.x, t.y - t.radius - 14);
+    }
+
+    // "THIEF!" warning near stash when incoming
+    if (t.distToStash() < CONFIG.THIEF_WARNING_STASH_RANGE && t.state === 'incoming') {
+      const a = 0.6 + Math.sin(GS.totalTime * 6) * 0.4;
+      ctx.fillStyle = `rgba(255,100,0,${a})`;
+      ctx.font      = 'bold 12px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('THIEF!', t.x, t.y - t.radius - 8);
+    }
+  }
+}
+
+// ============================================================
+// Screen: Start Screen
+// ============================================================
+function drawStartScreen() {
+  const bg = ctx.createLinearGradient(0, 0, 0, CONFIG.H);
+  bg.addColorStop(0, '#1a4a0a'); bg.addColorStop(1, '#0b2305');
+  ctx.fillStyle = bg; ctx.fillRect(0, 0, CONFIG.W, CONFIG.H);
+
+  // Title
+  ctx.save();
+  ctx.shadowBlur = 28; ctx.shadowColor = '#FFD700';
+  ctx.fillStyle  = '#FFD700';
+  ctx.font       = 'bold 68px serif';
+  ctx.textAlign  = 'center'; ctx.textBaseline = 'alphabetic';
+  ctx.fillText('Squirrel Scramble', CONFIG.W/2, 115);
+  ctx.restore();
+
+  ctx.fillStyle = '#90EE90';
+  ctx.font      = '19px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText('Collect acorns. Guard your stash. Outsmart the raiders!', CONFIG.W/2, 155);
+
+  // How-to-play box
+  ctx.fillStyle = 'rgba(0,0,0,0.45)';
+  roundRect(CONFIG.W/2-300, 170, 600, 230, 14); ctx.fill();
+
+  ctx.fillStyle = '#FFD700'; ctx.font = 'bold 15px sans-serif';
+  ctx.fillText('HOW TO PLAY', CONFIG.W/2, 197);
+
+  const lines = [
+    'WASD / Arrow Keys — Move    |    Click anywhere — Move there',
+    'Walk over an acorn to pick it up (carry ONE at a time)',
+    'Bring it to the Oak Tree stash (top-left) to deposit it',
+    'SHIFT — Dash sprint (4 s cooldown shown at bottom)',
+    'Chase raccoons & chipmunks away by touching them',
+    'Pick up power-ups for special abilities!',
+    'WIN: deposit 50 acorns   |   LOSE: stash emptied 3 times',
+  ];
+  ctx.font = '13px sans-serif';
+  lines.forEach((line, i) => {
+    ctx.fillStyle = i === lines.length-1 ? '#FFDD66' : '#CCFFCC';
+    ctx.fillText(line, CONFIG.W/2, 222 + i*26);
+  });
+
+  // Start button
+  const bx = CONFIG.W/2 - 105, by = 425;
+  ctx.fillStyle = '#FFD700';
+  roundRect(bx, by, 210, 52, 14); ctx.fill();
+  ctx.strokeStyle = '#B8860B'; ctx.lineWidth = 3;
+  roundRect(bx, by, 210, 52, 14); ctx.stroke();
+  ctx.fillStyle = '#1a1a1a'; ctx.font = 'bold 22px sans-serif';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('▶  START GAME', CONFIG.W/2, by + 26);
+
+  // Animated demo squirrels
+  const f = Math.floor(Date.now() / 220) % 2;
+  drawSquirrel(130, 390, 1, f, null, false);
+  drawSquirrel(770, 390, -1, f, null, false);
+  drawRaccoon(440, 390, 1, f, false);
+
+  // Level up note at bottom
+  ctx.fillStyle = 'rgba(255,255,255,0.55)';
+  ctx.font      = '11px sans-serif';
+  ctx.fillText('Difficulty increases every 60 seconds — can you last to Level 5?', CONFIG.W/2, 500);
+}
+
+// ============================================================
+// Screen: Game Over
+// ============================================================
+function drawGameOverScreen() {
+  ctx.fillStyle = 'rgba(0,0,0,0.76)'; ctx.fillRect(0, 0, CONFIG.W, CONFIG.H);
+
+  ctx.save();
+  ctx.shadowBlur = 24; ctx.shadowColor = '#FF0000';
+  ctx.fillStyle  = '#FF4444';
+  ctx.font       = 'bold 62px serif';
+  ctx.textAlign  = 'center'; ctx.textBaseline = 'alphabetic';
+  ctx.fillText('GAME OVER', CONFIG.W/2, 165);
+  ctx.restore();
+
+  ctx.fillStyle = '#FFF'; ctx.font = '21px sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+  ctx.fillText(`Your stash was emptied ${GS.strikes} time${GS.strikes!==1?'s':''}!`, CONFIG.W/2, 235);
+  ctx.fillText(`Final Score: ${GS.score}`, CONFIG.W/2, 272);
+  ctx.fillText(`Acorns Deposited: ${GS.stash}`, CONFIG.W/2, 309);
+  const m = Math.floor(GS.totalTime/60).toString().padStart(2,'0');
+  const s = Math.floor(GS.totalTime%60).toString().padStart(2,'0');
+  ctx.fillText(`Time: ${m}:${s}`, CONFIG.W/2, 346);
+
+  ctx.fillStyle = '#FFD700'; ctx.font = 'bold 16px sans-serif';
+  ctx.fillText('Level reached: ' + GS.level, CONFIG.W/2, 383);
+
+  // Play again button
+  const bx = CONFIG.W/2 - 115, by = 418;
+  ctx.fillStyle = '#FFD700'; roundRect(bx, by, 230, 52, 14); ctx.fill();
+  ctx.strokeStyle = '#B8860B'; ctx.lineWidth = 3; roundRect(bx, by, 230, 52, 14); ctx.stroke();
+  ctx.fillStyle = '#1a1a1a'; ctx.font = 'bold 22px sans-serif'; ctx.textBaseline = 'middle';
+  ctx.fillText('▶  PLAY AGAIN', CONFIG.W/2, by + 26);
+}
+
+// ============================================================
+// Screen: Victory
+// ============================================================
+function drawVictoryScreen() {
+  ctx.fillStyle = 'rgba(0,0,10,0.62)'; ctx.fillRect(0, 0, CONFIG.W, CONFIG.H);
+
+  ctx.save();
+  ctx.shadowBlur = 36; ctx.shadowColor = '#FFD700';
+  ctx.fillStyle  = '#FFD700';
+  ctx.font       = 'bold 72px serif';
+  ctx.textAlign  = 'center'; ctx.textBaseline = 'alphabetic';
+  ctx.fillText('VICTORY!', CONFIG.W/2, 155);
+  ctx.restore();
+
+  ctx.fillStyle = '#FFF'; ctx.font = '21px sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+  ctx.fillText('You stashed 50 acorns — the forest is yours!', CONFIG.W/2, 228);
+  ctx.fillText(`Final Score: ${GS.score}`, CONFIG.W/2, 265);
+  ctx.fillText(`Level Reached: ${GS.level}`, CONFIG.W/2, 302);
+  const m = Math.floor(GS.totalTime/60).toString().padStart(2,'0');
+  const s = Math.floor(GS.totalTime%60).toString().padStart(2,'0');
+  ctx.fillText(`Time: ${m}:${s}`, CONFIG.W/2, 339);
+
+  // Play again button
+  const bx = CONFIG.W/2 - 115, by = 380;
+  ctx.fillStyle = '#FFD700'; roundRect(bx, by, 230, 52, 14); ctx.fill();
+  ctx.strokeStyle = '#B8860B'; ctx.lineWidth = 3; roundRect(bx, by, 230, 52, 14); ctx.stroke();
+  ctx.fillStyle = '#1a1a1a'; ctx.font = 'bold 22px sans-serif'; ctx.textBaseline = 'middle';
+  ctx.fillText('▶  PLAY AGAIN', CONFIG.W/2, by + 26);
+}
+
+// ============================================================
+// Screen: Level-Up Banner (overlay during play)
+// ============================================================
+function drawLevelUpBanner() {
+  const t  = GS.levelUpBannerTimer / CONFIG.LEVEL_UP_BANNER_DURATION;
+  const a  = Math.min(1, t * 3);           // fade in
+  const sc = 1 + (1 - t) * 0.15;          // slight shrink as it ages
+
+  ctx.save();
+  ctx.globalAlpha = a;
+  ctx.translate(CONFIG.W/2, CONFIG.H/2 - 10);
+  ctx.scale(sc, sc);
+  ctx.fillStyle = 'rgba(255,215,0,0.9)';
+  roundRect(-165, -48, 330, 90, 18); ctx.fill();
+  ctx.strokeStyle = '#B8860B'; ctx.lineWidth = 3;
+  roundRect(-165, -48, 330, 90, 18); ctx.stroke();
+  ctx.fillStyle    = '#1a1a1a';
+  ctx.font         = 'bold 34px serif';
+  ctx.textAlign    = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(`LEVEL ${GS.level}!`, 0, -14);
+  ctx.font      = '16px sans-serif';
+  ctx.fillStyle = '#3a2200';
+  ctx.fillText('The forest gets more dangerous...', 0, 20);
+  ctx.restore();
+}
+
+// ============================================================
+// Screen: Paused overlay
+// ============================================================
+function drawPausedOverlay() {
+  ctx.fillStyle = 'rgba(0,0,0,0.52)'; ctx.fillRect(0, 0, CONFIG.W, CONFIG.H);
+  ctx.fillStyle = '#FFF';
+  ctx.font      = 'bold 52px serif';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText('PAUSED', CONFIG.W/2, CONFIG.H/2 - 20);
+  ctx.font = '18px sans-serif';
+  ctx.fillText('Press  P  or  ESC  to resume', CONFIG.W/2, CONFIG.H/2 + 35);
+}
+
+// ============================================================
+// Draw: Full game world
+// ============================================================
+function drawGameWorld() {
+  drawBackground();
+  drawStashTree();
+
+  // Power-ups
+  for (const pu of GS.powerUps) {
+    if (!pu.collected) drawPowerUpItem(pu);
+  }
+
+  // Acorns on ground
+  for (const a of GS.acorns) drawAcornOnGround(a);
+
+  // Thieves
+  for (const t of GS.thieves) {
+    if (!t.active) continue;
+    if (t.type === 'raccoon')   drawRaccoon(t.x, t.y, t.facing, t.walkFrame, t.state === 'stealing');
+    else                        drawChipmunk(t.x, t.y, t.facing, t.walkFrame);
+  }
+
+  // Player
+  const p = GS.player;
+  drawSquirrel(p.x, p.y, p.facing, p.walkFrame, p.holdingAcorn, p.energyActive);
+
+  // Particles
+  for (const pt of GS.particles) pt.draw();
+
+  // Thief warning overlays
+  drawThiefWarnings();
+
+  // HUD always on top
+  drawHUD();
+}
+
+// ============================================================
+// Main game loop
+// ============================================================
+let lastTime = 0;
+
+function gameLoop(timestamp) {
+  const dt = Math.min((timestamp - lastTime) / 1000, 0.05);
+  lastTime = timestamp;
+
+  ctx.clearRect(0, 0, CONFIG.W, CONFIG.H);
+
+  switch (GS.screen) {
+    case 'START_SCREEN':
+      drawStartScreen();
+      break;
+
+    case 'PLAYING':
+      updateGame(dt);
+      drawGameWorld();
+      break;
+
+    case 'LEVEL_UP_BANNER':
+      updateGame(dt);
+      drawGameWorld();
+      drawLevelUpBanner();
+      break;
+
+    case 'PAUSED':
+      drawGameWorld();
+      drawPausedOverlay();
+      break;
+
+    case 'GAME_OVER':
+      drawGameWorld();
+      drawGameOverScreen();
+      break;
+
+    case 'VICTORY':
+      updateGame(dt);   // keeps firework particles going
+      drawGameWorld();
+      drawVictoryScreen();
+      break;
+  }
+
+  requestAnimationFrame(gameLoop);
+}
+
+// Pause when the tab is hidden to prevent large delta-time jumps on restore
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden && GS.screen === 'PLAYING') {
+    GS.prevScreen = GS.screen;
+    GS.screen = 'PAUSED';
+  }
+});
+
+// Kick off the loop
+requestAnimationFrame(ts => { lastTime = ts; requestAnimationFrame(gameLoop); });
+</script>
+</body>
+</html>
